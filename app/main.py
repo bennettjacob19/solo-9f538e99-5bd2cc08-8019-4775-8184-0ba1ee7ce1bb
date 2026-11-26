@@ -14,9 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__, state
 from .routes import router
+from .verify_routes import router as verify_router
 
 TAGS_METADATA = [
     {"name": "drill", "description": "绑定管理、双连接排程、预备语句缓存与批次取数"},
+    {"name": "verify-sql", "description": "换 SQL 前在同一快照核对新旧 id/status，一致才换版"},
 ]
 
 
@@ -57,11 +59,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    from .models import VerifySqlIn
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=TAGS_METADATA,
+    )
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    components["VerifySqlIn"] = VerifySqlIn.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
+
 # Canonical JSON API under /api (shown in /docs) ...
 app.include_router(router, prefix="/api")
+app.include_router(verify_router, prefix="/api")
 # ... plus root-level aliases (/batches, /sessions, /cache ...) for clients
 # that prefer unversioned paths. Kept out of the schema to avoid duplicate docs.
 app.include_router(router, include_in_schema=False)
+app.include_router(verify_router, include_in_schema=False)
 
 
 @app.get("/", tags=["meta"], summary="服务入口与导览")
@@ -74,6 +103,7 @@ def root() -> dict:
         "start_here": {
             "templates": "GET /api/templates",
             "add_or_rebind": "PUT /api/sessions/{session}/bindings/{name}",
+            "verify_sql_before_swap": "POST /api/sessions/{session}/bindings/{name}/verify",
             "submit_batch": "POST /api/batches",
             "plan_only": "POST /api/batches/plan",
             "cache": "GET /api/cache",

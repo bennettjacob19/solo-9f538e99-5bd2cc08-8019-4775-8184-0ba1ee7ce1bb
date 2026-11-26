@@ -40,6 +40,8 @@ def _clean_state(client):
     # Empty batch history.
     with state.runtime.store._lock:
         state.runtime.store._items.clear()
+    # Empty verify-before-swap history.
+    state.verify_store.clear()
     # Empty both physical prepared-statement caches for cache-isolation tests.
     for slot in state.runtime.slots:
         with slot.lock:

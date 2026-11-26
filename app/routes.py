@@ -29,8 +29,15 @@ def get_templates() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def _binding_payload(b: Binding) -> dict[str, Any]:
     d = b.to_dict()
+    try:
+        token = state.bindings.identity_token(b.session, b.name)
+        d["generation"] = token["generation"]
+        d["delete_count"] = token["deletes"]
+    except Exception:
+        pass
     d["links"] = {
         "self": f"/api/sessions/{b.session}/bindings/{b.name}",
+        "verify_sql": f"/api/sessions/{b.session}/bindings/{b.name}/verify",
         "run_example": "/api/batches",
     }
     return d

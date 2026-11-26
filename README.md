@@ -371,3 +371,135 @@ requirements.txt / requirements-dev.txt
    `max_length=8`。
 7. 没有配 CI workflow，也没有用真实浏览器点 Swagger UI（仅验证 `/docs` 200 与
    OpenAPI 内容）。
+
+---
+
+## 8. 换 SQL 前先核对新旧取数一致（verify-before-swap）
+
+报表换 SQL 前，用同一组参数把「现绑定旧 SQL」和「候选 SELECT」在 **同一个
+PostgreSQL 快照** 里各跑一遍，按编号比对 `id` / `status`；**完全一致才换版**。
+
+### 8.1 在 `/docs` 提交
+
+Swagger 中找到
+`POST /api/sessions/{session}/bindings/{name}/verify`（Try it out）：
+
+```json
+{
+  "candidate_sql": "SELECT id, status FROM deployments WHERE service = :service ORDER BY id",
+  "params": {"service": "api-gateway"},
+  "temp_file_limit_mib": 64,
+  "max_rows": 100000,
+  "auto_swap": true
+}
+```
+
+- 路径里选 **会话 + 查询名**（即要换版的原绑定，必须已存在）。
+- `candidate_sql`（兼容 `new_sql` / `sql` / `proposed_sql` / `candidate` 等）
+  是候选 SELECT；`params`（兼容 `parameters` / `args`）是 **两版共用** 参数，
+  数组 / 命名对象 / 单参数标量都可以；旧 `$1` 绑定配命名对象时也做了兜底对齐。
+- `temp_file_limit_mib`（兼容 `temp_file_limit` 等）：本核对事务的 PG
+  `temp_file_limit`，单位 MiB（下发为 `set_config('temp_file_limit','<n>MB',true)`）。
+- `max_rows`（兼容 `row_limit` / `replica_max_rows` 等）：应用从库 **每版**
+  取回行数上限；任一版超过即判定超限。
+- 核对事务固定 `SET LOCAL work_mem='1MB'`，因此大结果集排序/哈希会真实落临时文件，
+  临时文件上限不是摆设。
+- `auto_swap:false`（或调用 `.../check`、`.../compare`）只核对不换版，返回
+  `verification_id`，之后可 `POST /api/verifications/{id}/apply` 两阶段换版。
+
+为兼容不同调用方，同一能力还挂了多组路径别名（默认 `/docs` 只展示主路径，
+其余 `include_in_schema=False`），例如
+`.../verify-sql`、`.../check`、`.../compare`、`.../replace`、`.../swap`、
+`/api/sql/verify`、`/api/bindings/verify`、`/api/bindings/{session}/{name}/verify`、
+`/api/verify-sql/{session}/{name}`、`/api/verifications`，以及不带 `/api` 的根别名。
+
+### 8.2 快照、连接与比对口径
+
+- **借空闲连接**：非阻塞扫描两条 `ConnectionSlot`，借到哪条用哪条，响应回
+  `connection` / `connection_slot` / `backend_pid`；一条连接被占时自动用另一条；
+  两条都忙返回 **409 `no_idle_connection`**。不新建第三条长连接，也不获取全局
+  `batch_lock`（与批次可并存，靠每连接 `RLock` 互斥）。
+- **同一快照**：在借来的连接上开启
+  `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`，在同一事务里
+  `SET LOCAL work_mem/temp_file_limit` 后顺序执行旧、新两条查询，再 `COMMIT`；
+  `snapshot.pg_current_snapshot` 回显快照号。`SET LOCAL` 事务结束即还原，
+  不会污染长连接；出错一定 `ROLLBACK`，后续批次/健康检查不受影响。
+- **不进 PREPARE LRU**：核对用 `psycopg.sql.Literal` 安全内联参数后直接执行，
+  不创建 `rq_*` 预备语句、不动每连接 2 条的 LRU 元数据，因此换版后第一批仍按
+  原 PREPARE 限额真实 PREPARE 新 SQL。
+- **只认 id/status**：按列名（找不到再按位置）取整数 `id` 与文本 `status`，
+  回传列类型 OID。比对用 `id -> 状态列表` 的多重映射：
+  - 只在一版出现 → `missing_in_new` / `missing_in_old`（缺行）；
+  - 任一版同编号出现 >1 次 → `duplicate_id`（编号重复，即使状态相同也算差异）；
+  - 同编号状态多重集不同 → `status_mismatch`。
+- 返回 **按编号升序最小的 20 个差异编号** `difference_ids`（另有
+  `diff_ids` / `difference_numbers` / `smallest_20_difference_ids` 等别名）、
+  `difference_count`（差异编号总数）、至多 20 条 `differences` 明细
+  （含 `kind/type/issues`、两版状态与计数、重复/缺失布尔位）和分类计数
+  `summary`。
+- **实际取回行数**：`old_row_count` / `candidate_row_count`（及 `new_row_count`
+  等别名）、`row_counts`、`fetched_row_counts`、`total_fetched_rows`。
+- **打包返回**：`old_rows` / `new_rows`（位置数组）、`old_records` /
+  `new_records`（小结果集）、`raw_results`、`differences` 一并返回，
+  `packaged_item_count` 按条统计原始行 + 差异明细；超过 2000 行/版时只保留紧凑
+  数组视图，避免 10 万行时同一份数据序列化成多份。
+
+### 8.3 何时跳过换版
+
+以下情况 **都不会改绑定**，HTTP 200 返回 `swapped:false,status:"skipped"`
+（差异不一致是 `status:"differences_found"`；绑定不存在 404；请求体/参数错误
+422；无空闲连接 409）：
+
+- 任一版取回行数 `> max_rows`：`reason="row_limit_exceeded"`；
+- PG 报错（含临时文件超限 SQLSTATE `53400` →
+  `reason="temp_file_limit_exceeded"`，其它 → `execution_error"` 并回传
+  `error.sqlstate`，如坏表 `42P01`）；
+- 核对期间原绑定被改 / 删 / **同名删除后重建**：基于
+  `(generation, deletes)` 乐观令牌在换版瞬间原子校验，
+  `reason` 取 `binding_changed` / `binding_deleted` /
+  `binding_deleted_and_recreated`，并保留期间重建出的绑定。
+
+只有 `consistent=true` 才调用 `BindingStore.compare_and_put` 写入候选 SQL，
+版本号照常自增，`params` 命名规则不变。**已受理批次** 的不可变快照仍指向旧 SQL
+（既有机制 + 测试守护），**之后的新批次** 解析到新 SQL，PREPARE/限额/LRU 行为不变。
+
+### 8.4 同名绑定「删后重建」自测与实测结果
+
+新增 `tests/test_verify_sql.py`（32 个用例，含真实 PG HTTP E2E、确定性栅栏的
+并发删建、模板绑定、10 万行、真实 `53400`、借连接/409、两阶段 apply 与路径/字段别名）：
+
+```text
+$ pytest -q
+61 passed in ~6s        # 原 29 + 新增 32
+```
+
+真机 HTTP 自测脚本（仅标准库，含一个约 4s 的确定性慢查询来制造并发窗口）：
+
+```bash
+python scripts/serve_local.py
+python scripts/demo_verify.py
+# DEMO_VERIFY: ALL CHECKS PASSED（20 项断言，重复运行稳定）
+```
+
+其中第 5 组实测：核对进行中 `DELETE` 同名绑定再 `PUT` 重建 → 在途核对返回
+`swapped=false / skipped` 且原因属于绑定变更族；随后 `GET` 该绑定确认
+**库里实际留下的是重建 SQL（version 重新为 1），候选 SQL 没有覆盖它**；
+再用与重建绑定一致的候选核对，正常换版到 v2。原 `scripts/demo_http.py`
+33 项断言也仍全部通过。10 万行用例（建 100000 行表，两版各取回 10 万）
+约 3.5s（TestClient，含造数），真机 HTTP 默认打包响应约 36 MB / 1.8s
+（多别名冗余结构；紧凑模式会更小）。
+
+### 8.5 本次实现的缺项
+
+1. 本沙箱 **没有 docker / dockerd**，`docker compose up --build` 未能在这里实跑；
+   已校验 `docker-compose.yml` YAML 合法，新代码全部在 `app/` 包内、无新增依赖，
+   Dockerfile 的 `COPY app ./app` 会直接带上。compose 的 `drill` 是官方镜像创建的
+   超级用户，可设置 `temp_file_limit`（该 GUC 上下文为 superuser）；pgserver 同理。
+2. 两条查询跑在 **同一条连接的同一事务** 里（最强快照一致性、实现简单），没有用
+   `pg_export_snapshot()` 让两条连接并行核对；超大结果集的墙钟时间约为两查询之和。
+3. 行数上限在应用 `fetchall()` 后判定，语义是「实际取回行数超过上限即跳过」，
+   并未在传输层提前中断；小上限测试数据量都很小。需要严格少拉数据可改服务端游标
+   `fetchmany(cap+1)` + count 包装。
+4. 为兼容未知调用方，注册了较多路径/字段别名，`/docs` 默认只展示主核对与
+   `/api/verifications` 两组，其余别名隐藏；响应里也带了不少同义字段，体积略大。
+5. 仍沿用内存绑定/核对记录；核对历史重启即空。未加鉴权与只读强制（同第 7 节）。

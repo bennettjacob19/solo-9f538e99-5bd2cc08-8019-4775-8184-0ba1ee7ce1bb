@@ -173,3 +173,101 @@ class BindingUpsert(BaseModel):
     )
     title: str | None = None
     description: str | None = None
+
+
+class VerifySqlIn(BaseModel):
+    """Candidate SELECT verification before swapping a named binding.
+
+    Every field accepts several common naming variants; the route also runs a
+    lenient raw-key resolver so alternative clients are not rejected.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "核对一致后自动换版（1 MiB 临时文件上限，最多取回 10 万行）",
+                    "value": {
+                        "candidate_sql": (
+                            "SELECT id, status FROM deployments "
+                            "WHERE service = $1 ORDER BY id"
+                        ),
+                        "params": {"service": "api-gateway"},
+                        "temp_file_limit_mib": 64,
+                        "max_rows": 100000,
+                        "auto_swap": True,
+                    },
+                },
+                {
+                    "summary": "只核对不换版",
+                    "value": {
+                        "new_sql": "SELECT id, status FROM deployments ORDER BY id",
+                        "params": [],
+                        "temp_file_limit_mib": 256,
+                        "max_rows": 100000,
+                        "swap": False,
+                    },
+                },
+            ]
+        },
+    )
+
+    session: str | None = Field(
+        default=None,
+        max_length=128,
+        validation_alias=AliasChoices("session", "session_id", "sid"),
+    )
+    name: str | None = Field(
+        default=None,
+        max_length=128,
+        validation_alias=AliasChoices("name", "query_name", "qname", "binding_name"),
+    )
+    candidate_sql: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "candidate_sql", "new_sql", "sql", "candidate", "proposed_sql",
+            "target_sql", "replacement_sql", "replace_sql", "next_sql",
+            "select_sql", "candidate_select", "candidate_query", "new_query",
+        ),
+        description="候选 SELECT；与现绑定共用 params。",
+    )
+    params: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("params", "parameters", "args", "bind_params"),
+        description="两版共用参数：数组 / 命名对象 / 单参数标量。",
+    )
+    temp_file_limit_mib: int | str | None = Field(
+        default=1024,
+        validation_alias=AliasChoices(
+            "temp_file_limit_mib", "temp_file_limit_mb", "temp_file_limit",
+            "pg_temp_file_limit_mib", "temp_limit_mib", "temp_file_quota_mib",
+            "max_temp_file_mib",
+        ),
+        description="本核对事务的 PostgreSQL temp_file_limit，单位 MiB（work_mem 固定 1 MiB）。",
+    )
+    max_rows: int | None = Field(
+        default=1_000_000,
+        ge=1,
+        validation_alias=AliasChoices(
+            "max_rows", "row_limit", "max_row_count", "max_fetched_rows",
+            "fetch_row_limit", "row_fetch_limit", "replica_max_rows",
+            "application_row_limit", "app_row_limit", "row_cap",
+            "max_result_rows", "max_records",
+        ),
+        description="应用从库（任一版本）取回的行数上限；超过则跳过换版。",
+    )
+    auto_swap: bool | None = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "auto_swap", "swap_if_consistent", "swap", "apply",
+            "apply_if_consistent", "replace", "do_swap",
+        ),
+        description="一致时是否立即换版；false 时只产出核对记录，可再调 apply。",
+    )
+    include_raw: bool | None = Field(
+        default=True,
+        validation_alias=AliasChoices("include_raw", "with_raw", "return_raw", "raw"),
+        description="是否在响应中打包两版原始行与差异明细。",
+    )

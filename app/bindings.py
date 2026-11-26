@@ -60,6 +60,109 @@ class BindingStore:
         self._lock = threading.RLock()
         # session -> name -> Binding
         self._sessions: dict[str, dict[str, Binding]] = {}
+        # (session, name) -> mutation counters. A monotonic generation token is
+        # essential for detecting "delete then recreate under the same name":
+        # such a binding is version=1 again, so comparing versions alone is not
+        # enough. Every put *and* every delete bumps the generation.
+        self._revisions: dict[tuple[str, str], dict[str, int]] = {}
+        # Coarse process-wide mutation counter (any binding write/delete).
+        self.global_revision: int = 0
+
+    def _rev_state_locked(self, session: str, name: str) -> dict[str, int]:
+        key = (session, name)
+        state = self._revisions.get(key)
+        if state is None:
+            state = {"generation": 0, "puts": 0, "deletes": 0}
+            self._revisions[key] = state
+        return state
+
+    def identity_token(self, session: str, name: str) -> dict[str, Any]:
+        """Opaque optimistic-concurrency token for one (session, name)."""
+        session = _clean(session, "session")
+        name = _clean(name, "name")
+        with self._lock:
+            st = self._rev_state_locked(session, name)
+            bucket = self._sessions.get(session)
+            current = bucket.get(name) if bucket else None
+            return {
+                "session": session,
+                "name": name,
+                "generation": st["generation"],
+                "puts": st["puts"],
+                "deletes": st["deletes"],
+                "global_revision": self.global_revision,
+                "version": current.version if current else None,
+                "exists": current is not None,
+                "updated_at": current.updated_at if current else None,
+                "created_at": current.created_at if current else None,
+                "key": current.key if current else None,
+            }
+
+    def compare_and_put(
+        self,
+        session: str,
+        name: str,
+        expected_generation: int,
+        *,
+        expected_deletes: int | None = None,
+        sql: str | None = None,
+        template: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Optimistic swap: put only if the binding was not touched since capture.
+
+        Returns a dict with ``outcome`` in ``swapped`` / ``modified`` /
+        ``deleted`` / ``deleted_and_recreated``. When the outcome is not
+        ``swapped`` the current binding (possibly the recreated one) is left
+        exactly as-is and returned under ``current``.
+        """
+        session = _clean(session, "session")
+        name = _clean(name, "name")
+        with self._lock:
+            st = self._rev_state_locked(session, name)
+            generation_now = st["generation"]
+            deletes_now = st["deletes"]
+            bucket = self._sessions.get(session)
+            current = bucket.get(name) if bucket else None
+
+            unchanged = generation_now == expected_generation
+            if expected_deletes is not None and deletes_now != expected_deletes:
+                unchanged = False
+
+            if not unchanged:
+                if current is None:
+                    outcome = "deleted"
+                elif expected_deletes is not None and deletes_now > expected_deletes:
+                    outcome = "deleted_and_recreated"
+                else:
+                    outcome = "modified"
+                return {
+                    "outcome": outcome,
+                    "swapped": False,
+                    "current": current,
+                    "generation_before": expected_generation,
+                    "generation_after": generation_now,
+                    "deletes_before": expected_deletes,
+                    "deletes_after": deletes_now,
+                }
+
+            new_binding, old_binding = self.put(
+                session,
+                name,
+                sql=sql,
+                template=template,
+                title=title,
+                description=description,
+            )
+            st = self._rev_state_locked(session, name)
+            return {
+                "outcome": "swapped",
+                "swapped": True,
+                "binding": new_binding,
+                "old": old_binding,
+                "generation_after": st["generation"],
+            }
 
     # ---- writes -------------------------------------------------------
     def put(
@@ -139,6 +242,10 @@ class BindingStore:
                 rebind_count=(old.rebind_count + 1) if old else 0,
             )
             bucket[name] = binding
+            st = self._rev_state_locked(session, name)
+            st["generation"] += 1
+            st["puts"] += 1
+            self.global_revision += 1
             return binding, old
 
     def delete(self, session: str, name: str) -> Binding:
@@ -148,7 +255,12 @@ class BindingStore:
             bucket = self._sessions.get(session)
             if not bucket or name not in bucket:
                 raise BindingNotFound(f"会话 {session!r} 中没有查询名 {name!r}。")
-            return bucket.pop(name)
+            removed = bucket.pop(name)
+            st = self._rev_state_locked(session, name)
+            st["generation"] += 1
+            st["deletes"] += 1
+            self.global_revision += 1
+            return removed
 
     # ---- reads --------------------------------------------------------
     def get(self, session: str, name: str) -> Binding:
